@@ -1,0 +1,107 @@
+#!/bin/bash
+#$ -l rt_F=4
+#$ -l h_rt=24:00:00
+#$ -j y
+#$ -cwd
+#$ -M edison.marrese@aist.go.jp
+
+NHOSTS=4
+
+source /etc/profile.d/modules.sh
+
+# When using GPUs other than A-100 use the lines below
+module load cuda/10.2/10.2.89
+module load cudnn/7.6/7.6.5  
+module load nccl/2.6/2.6.4-1
+module load gcc/7.4.0
+module load openmpi
+
+source /home/aad13288rp/miniconda3/bin/activate early
+
+export CUDA_HOME='/apps/cuda/10.2.89/'
+export MKL_SERVICE_FORCE_INTEL=1
+
+NUM_NODES=${NHOSTS}
+NUM_GPUS_PER_NODE=4 # change to 8 if its A100
+NUM_GPUS_PER_SOCKET=$(expr ${NUM_GPUS_PER_NODE} / 2)
+NUM_PROCS=$(expr ${NUM_NODES} \* ${NUM_GPUS_PER_NODE})
+IP="$HOSTNAME"
+MASTER_ADDR=$IP
+# For GPUs other than V-100 use the line below
+NCCL_SOCKET_IFNAME=eth0
+#For A-100 use the line below
+#NCCL_SOCKET_IFNAME=bond0
+MASTER_PORT=8123
+################################
+
+PREFIX=insertions.detok
+DATA_PATH="$HOME/data/early"
+
+INPUT_PATH="$DATA_PATH/pretraining/$PREFIX"
+OUTPUT_PATH="/scratch/aad13288rp/checkpoints_insertions_mlm_100"
+
+# total train examples on insertions is 9616458
+# batch size 8bs*4gpus*4nodes*4accum = 512
+# total updates ~18780 per epoch
+
+TOTAL_NUM_UPDATES=1878000  # 100 epochs through IMDB for bsz 32
+WARMUP_UPDATES=112680      # 6 percent of the number of updates
+LR=1e-06                # Peak LR for polynomial LR scheduler.
+MAX_SENTENCES=8         # Batch size.
+ROBERTA_PATH="$DATA_PATH/roberta.base/model.pt"
+
+mkdir -p "$OUTPUT_PATH"
+
+COMMAND=($HOME/miniconda3/envs/early/bin/fairseq-train "$INPUT_PATH/data-bin" \
+    --restore-file $ROBERTA_PATH \
+    --max-positions 512 \
+    --batch-size $MAX_SENTENCES \
+    --max-tokens 4400 \
+    --task levenshtein_prediction \
+    --reset-optimizer \
+    --reset-dataloader \
+    --reset-meters \
+    --required-batch-size-multiple 1 \
+    --init-token 0 \
+    --arch roberta_base \
+    --criterion levenshtein_prediction \
+    --dropout 0.1 \
+    --attention-dropout 0.1 \
+    --weight-decay 0.1 \
+    --optimizer adam \
+    --adam-betas "(0.9, 0.98)" \
+    --adam-eps 1e-06 \
+    --clip-norm 0.0 \
+    --lr-scheduler polynomial_decay \
+    --lr $LR \
+    --total-num-update $TOTAL_NUM_UPDATES \
+    --warmup-updates $WARMUP_UPDATES \
+    --max-epoch 100 \
+    --best-checkpoint-metric accuracy \
+    --maximize-best-checkpoint-metric \
+    --shorten-method "truncate" \
+    --find-unused-parameters \
+    --update-freq 4  \
+    --fp16 \
+    --fp16-init-scale 4 \
+    --threshold-loss-scale 1 \
+    --fp16-scale-window 128 \
+    --no-epoch-checkpoints \
+    --save-dir "$OUTPUT_PATH" \
+    --tensorboard-logdir "$OUTPUT_PATH/tensorboard"  \
+    --wandb-project "early" \
+    --distributed-port $MASTER_PORT \
+    --distributed-init-method tcp://$IP:$MASTER_PORT \
+    --distributed-world-size $NUM_PROCS \
+    --nprocs-per-node $NUM_GPUS_PER_NODE)
+
+# --delta-x-loss \
+
+# just multiplying the number of GPUs by the number of nodes (to account for both 4-V100 and 8-A100 nodes) to initialize the node rank
+# the `$(cat $SGE_JOB_HOSTLIST | head -$NUM)` command just reads the current node name from the $SGE_JOB_HOSTLIST file (the head -$NUM) command will read it from the appropriate.
+mpirun \
+    -np 1 -host $(cat $SGE_JOB_HOSTLIST | head -1) "${COMMAND[@]}" --distributed-rank 0 : \
+    -np 1 -host $(cat $SGE_JOB_HOSTLIST | head -2 | tail -1) "${COMMAND[@]}" --distributed-rank $(expr 1 \* ${NUM_GPUS_PER_NODE}) : \
+    -np 1 -host $(cat $SGE_JOB_HOSTLIST | head -3 | tail -1) "${COMMAND[@]}" --distributed-rank $(expr 2 \* ${NUM_GPUS_PER_NODE}) : \
+    -np 1 -host $(cat $SGE_JOB_HOSTLIST | head -4 | tail -1) "${COMMAND[@]}" --distributed-rank $(expr 3 \* ${NUM_GPUS_PER_NODE}) 
+

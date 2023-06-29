@@ -1,0 +1,84 @@
+#!/bin/bash
+#$ -l rt_F=1
+#$ -l h_rt=24:00:00
+#$ -j y
+#$ -cwd
+#$ -M edison.marrese@aist.go.jp
+
+source /etc/profile.d/modules.sh
+
+# When using GPUs other than A-100 use the lines below
+module load cuda/10.2/10.2.89
+module load cudnn/7.6/7.6.5  
+module load nccl/2.6/2.6.4-1
+module load gcc/7.4.0
+module load openmpi
+
+source /home/aad13288rp/miniconda3/bin/activate early
+
+export CUDA_HOME='/apps/cuda/10.2.89/'
+export MKL_SERVICE_FORCE_INTEL=1
+
+PREFIX=x.detok
+DATA_PATH="$HOME/storage-edison/data/early"
+
+INPUT_PATH="$DATA_PATH/pretraining/$PREFIX"
+# OUTPUT_PATH="$INPUT_PATH"
+
+OUTPUT_PATH="/scratch/aad13288rp/checkpoints_x_mlm_100"
+
+# total train examples on x is 80000
+# batch size 8bs*4gpus*1node*4accum = 128 
+# total updates 625 per epoch
+
+TOTAL_NUM_UPDATES=62500  # 100 epochs
+WARMUP_UPDATES=3750       # 6 percent of the number of updates
+LR=1e-05                  # Peak LR for polynomial LR scheduler.
+MAX_SENTENCES=8           # Batch size.
+ROBERTA_PATH="$DATA_PATH/roberta.base/model.pt"
+
+mkdir -p "$OUTPUT_PATH"
+
+
+fairseq-train "$INPUT_PATH/data-bin" \
+    --restore-file $ROBERTA_PATH \
+    --max-positions 512 \
+    --batch-size $MAX_SENTENCES \
+    --max-tokens 4400 \
+    --task levenshtein_prediction \
+    --reset-optimizer \
+    --reset-dataloader \
+    --reset-meters \
+    --required-batch-size-multiple 1 \
+    --init-token 0 \
+    --arch roberta_base \
+    --criterion levenshtein_prediction \
+    --dropout 0.1 \
+    --attention-dropout 0.1 \
+    --weight-decay 0.1 \
+    --optimizer adam \
+    --adam-betas "(0.9, 0.98)" \
+    --adam-eps 1e-06 \
+    --clip-norm 0.0 \
+    --lr-scheduler polynomial_decay \
+    --lr $LR \
+    --total-num-update $TOTAL_NUM_UPDATES \
+    --warmup-updates $WARMUP_UPDATES \
+    --max-epoch 100 \
+    --best-checkpoint-metric f1 \
+    --maximize-best-checkpoint-metric \
+    --shorten-method "truncate" \
+    --find-unused-parameters \
+    --update-freq 4  \
+    --fp16 \
+    --fp16-init-scale 4 \
+    --threshold-loss-scale 1 \
+    --fp16-scale-window 128 \
+    --no-epoch-checkpoints \
+    --save-dir "$OUTPUT_PATH" \
+    --tensorboard-logdir "$OUTPUT_PATH/tensorboard" \
+    --wandb-project "early" | tee -a "$OUTPUT_PATH/train.log"
+
+#     --delta-x-loss \
+
+exit
